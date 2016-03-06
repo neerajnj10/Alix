@@ -4,8 +4,6 @@ library(readr)
 base_path <- getwd()
 data_alix <- read_csv(paste0(base_path, "/data.csv"))
 
-#remove id
-data_alix$id <- NULL
 
 #separate train data with test.
 
@@ -15,11 +13,13 @@ test <- data_alix[-sub,]
 
 #remove 'train' column, we don't need it anymore.
 training$train <- NULL
-
+training$id <- NULL
 #for test,
 test$train <- NULL
-test$target_eval <- NULL
+testid <- test$id
 
+test$target_eval <- NULL
+test$id <- NULL
 
 #load the library
 library(glmnet)
@@ -40,7 +40,7 @@ VarSelection <- cv.glmnet(x = as.matrix(training[,c(2:301)]),
                                    type.measure="auc")
 
 #plotting auc, it gives fair result.
-plot(glmFitForVarSelection)
+plot(VarSelection)
 
 
 #Now the main part.
@@ -49,56 +49,86 @@ plot(glmFitForVarSelection)
 
 #we can select lambda.min or lambda.1se for it, lambda.min provides the coefficients for best model,
 #which could be little complex as well as lead to over fitting sometimes, while lambda.1se provides coefficient for 
-# a simpler model from best model, with added little uncertainity, which serves our purpose.
+# a simpler model from best model, with added little uncertainity.
 
 
-### I used both lambda techniques to check for comparison, and ultimately chose to settle with lambda.1se
+### I decided to used both lambda techniques to select the final set of features.
 
-c <- coef.cv.glmnet(VarSelection,s="lambda.1se",exact=T)
+
+### First using lambda.1se parameter.
+c1 <- coef.cv.glmnet(VarSelection,s="lambda.1se",exact=T)
 
 #only those coefficient values that are non-zero.
-inds <- which(c!=0)
-variables <-  row.names(c)[inds]
+inds <- which(c1!=0)
+variables <-  row.names(c1)[inds]
 `%ni%` <- Negate(`%in%`)
 
 #final variables.
-variables <- variables[variables %ni% '(Intercept)']
-variables
+variables1 <- variables[variables %ni% '(Intercept)']
+variables1
 
-#now using the above obtained list of variables to subset the training set predictors to smaller number but reatined predicting power. 
-newtrain <- training[,variables]
+
+###now using lamba.min for another variable set.
+c2 <- coef.cv.glmnet(VarSelection,s="lambda.min",exact=T)
+
+#only those coefficient values that are non-zero.
+inds <- which(c2!=0)
+variables <-  row.names(c2)[inds]
+`%ni%` <- Negate(`%in%`)
+
+#final variables.
+variables2 <- variables[variables %ni% '(Intercept)']
+variables2
+
+
+## finally combining both variable sets and getting unique features from them.
+
+#combining both the sets of variables.
+p <- c(variables1, variables2)
+p<- unique(p)
+
+
+#now using the above obtained list of variables to subset the training set predictors to smaller number but retained predicting power. 
+newtrain <- training[,p]
 newtrain <- as.data.frame(cbind(target, newtrain))
 newtrain$target <- as.factor(newtrain$target)
-
-
-library(h2o)
-h2o.init()
-
-training$target_eval <- as.factor(training$target_eval)
-train.hex <- as.h2o(training)
-test.hex <- as.h2o(test)
-model <- h2o.deeplearning(x= #2:301, y=1, training_frame = train.hex,
-                          buildModel 'deeplearning', 
-                          {"model_id":"deeplearning-8de7978b-22ed-4ff0-9a65-45d20beff737",
-                            "training_frame":"frame_0.750","validation_frame":"frame_0.250",
-                            "nfolds":"5","response_column":"target","ignored_columns":[],
-                            "ignore_const_cols":true,"activation":"TanhWithDropout",
-                            "hidden":[100,100],"epochs":"18","variable_importances":true,
-                            "fold_assignment":"Modulo","balance_classes":false,"checkpoint":"",
-                            "use_all_factor_levels":true,"train_samples_per_iteration":-2,
-                            "adaptive_rate":true,"input_dropout_ratio":"0.2","hidden_dropout_ratios":[0.4,0.8],
-                            "l1":0,"l2":0,"loss":"Automatic","distribution":"AUTO","score_interval":5,
-                            "score_training_samples":"0","score_validation_samples":0,"score_duty_cycle":"0.001",
-                            "stopping_rounds":5,"stopping_metric":"AUC","stopping_tolerance":0,"autoencoder":false,
-                            "keep_cross_validation_predictions":false,"target_ratio_comm_to_comp":0.05,
-                            "seed":3795404593086760400,"rho":0.99,"epsilon":1e-8,"max_w2":"Infinity",
-                            "initial_weight_distribution":"UniformAdaptive","classification_stop":0,
-                            "score_validation_sampling":"Uniform","diagnostics":true,"fast_mode":true,
-                            "force_load_balance":true,"single_node_mode":true,"shuffle_training_data":false,
-                            "missing_values_handling":"MeanImputation","quiet_mode":false,"sparse":false,
-                            "col_major":false,"average_activation":0,"sparsity_beta":0,
-                            "max_categorical_features":2147483647,"reproducible":false,
-                            "export_weights_and_biases":false,"elastic_averaging":false}
-  
 ```                        
                           
+                          
+```{r}
+library(caret)
+newtrain$target <- as.factor(ifelse(newtrain$target == 1, "X1", "X0"))
+FL <- as.formula(paste("target ~ ", paste(p, collapse = "+")))
+MyTrainControl = trainControl(method = "repeatedCV", number = 10, repeats = 50, 
+    returnResamp = "all", classProbs = TRUE, summaryFunction = twoClassSummary)
+model <- train(FL, data = newtrain, method = "glmnet", metric = "ROC", 
+               tuneGrid = expand.grid(.alpha = c(0, 1), .lambda = seq(0, 0.25, by = 0.005)), 
+               trControl = MyTrainControl)
+plot(model, metric = "ROC")
+
+
+##### making predictions #####
+
+pred <- predict(model, newdata = test, type = "prob") #probabilities of prediction.
+predresponse <- predict(model, newdata = test, type = "raw") #response classes.
+
+
+predictions1 <- as.data.frame(pred)
+predictions2 <- as.data.frame(predresponse)
+testID <- as.data.frame(testid)
+
+
+####### first submitting the response class file ######
+submit_response = as.data.frame(c(testID, predictions2))
+colnames(submit_response) <- c("Id", "target_eval")
+submit_response$target_eval <- as.factor(ifelse(submit_response$target_eval == "X1", "1", "0"))
+write.csv(submit_response, "problem2_responsefile.csv", row.names = F)
+
+
+####### now submitting the predicted probability file ######
+probresponse <- pmax(predictions1[,1], predictions1[,2], na.rm = TRUE) 
+probresponse <- as.data.frame(probresponse)
+submit_prob <- as.data.frame(c(testID,probresponse))
+colnames(submit_prob) <- c("Id", "target_prob")
+write.csv(submit_prob, "problem2_probabilityfile.csv", row.names = F)
+```
